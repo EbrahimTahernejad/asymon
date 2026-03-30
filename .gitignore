@@ -1,0 +1,58 @@
+# ── Claude ────────────────────────────────────────────────────────────────────
+.claude/
+
+# ── Go binaries & build output ────────────────────────────────────────────────
+/server
+/client
+/asymon
+dist/
+bin/
+out/
+
+# Built by `go build ./cmd/...`
+cmd/server/server
+cmd/client/client
+
+# ── Go toolchain ──────────────────────────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# ── OS / editor junk ──────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Secrets / local config ────────────────────────────────────────────────────
+*.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+config.local.*
+secrets.*
