@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -147,13 +148,9 @@ func (s *Server) handle(tc net.Conn) {
 	// Pre-build IP+UDP header template for this client
 	var hdr hdrTemplate
 	hdr.build(s.spoofSrc, clientIP4, s.spoofPort, clientPort)
-	vlog("%v: header template built — IP src=%v:%d dst=%v:%d baseSum=0x%04x",
-		remote,
-		net.IP(s.spoofSrc[:]), s.spoofPort,
-		net.IP(clientIP4[:]), clientPort,
-		hdr.baseSum,
+	vlog("%v: session ready — spoof src=%v dst=%v:%d",
+		remote, net.IP(s.spoofSrc[:]), net.IP(clientIP4[:]), clientPort,
 	)
-	vlog("%v: header template hex: %s", remote, hex.EncodeToString(hdr.tpl[:]))
 
 	var (
 		wg         sync.WaitGroup
@@ -247,29 +244,49 @@ func (s *Server) handle(tc net.Conn) {
 }
 
 func (s *Server) sendSpoofed(h *hdrTemplate, dst4 [4]byte, payload []byte) error {
-	pkt := make([]byte, 28+len(payload))
-	copy(pkt[:28], h.tpl[:])
+	totalLen := uint16(20 + 8 + len(payload))
+	udpLen   := uint16(8 + len(payload))
+	srcPort  := uint16(1024 + rand.Intn(64512)) // random ephemeral src port per packet
+	ipID     := uint16(rand.Intn(65536))
+
+	pkt := make([]byte, int(totalLen))
+
+	// IPv4 header — no DF flag (flags_frag = 0), matches Python behaviour
+	pkt[0] = 0x45
+	pkt[1] = 0
+	binary.BigEndian.PutUint16(pkt[2:4], totalLen)
+	binary.BigEndian.PutUint16(pkt[4:6], ipID)
+	pkt[6], pkt[7] = 0, 0 // flags=0, frag offset=0 — NO DF
+	pkt[8] = 64
+	pkt[9] = 17
+	// [10:12] checksum filled below
+	copy(pkt[12:16], h.src4[:]) // src IP
+	copy(pkt[16:20], dst4[:])
+
+	// UDP header
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], h.dstPort)
+	binary.BigEndian.PutUint16(pkt[24:26], udpLen)
+	// [26:28] UDP checksum filled below
+
 	copy(pkt[28:], payload)
 
-	totalLen := uint16(28 + len(payload))
-	udpLen := uint16(8 + len(payload))
-	binary.BigEndian.PutUint16(pkt[2:4], totalLen)
-	binary.BigEndian.PutUint16(pkt[24:26], udpLen)
-
-	// IP checksum (incremental: baseSum computed with length=0)
-	ipSum := h.baseSum + uint32(totalLen)
+	// IP checksum
+	var ipSum uint32
+	for i := 0; i < 20; i += 2 {
+		ipSum += uint32(binary.BigEndian.Uint16(pkt[i : i+2]))
+	}
 	for ipSum>>16 != 0 {
 		ipSum = (ipSum & 0xffff) + (ipSum >> 16)
 	}
 	binary.BigEndian.PutUint16(pkt[10:12], ^uint16(ipSum))
 
-	// UDP checksum over pseudo-header + UDP header + payload.
-	// Many middleboxes drop UDP with checksum=0 even though it's optional in IPv4.
-	binary.BigEndian.PutUint16(pkt[26:28], 0) // clear first
-	udpCksum := udpChecksum(h.tpl[12:16], h.tpl[16:20], pkt[20:])
+	// UDP checksum
+	udpCksum := udpChecksum(pkt[12:16], pkt[16:20], pkt[20:])
 	binary.BigEndian.PutUint16(pkt[26:28], udpCksum)
 
-	vlog("sendSpoofed: IP hdr hex: %s", hex.EncodeToString(pkt[:28]))
+	vlog("sendSpoofed: src_port=%d id=%d total=%d IP hdr: %s",
+		srcPort, ipID, totalLen, hex.EncodeToString(pkt[:28]))
 
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], dst4[:])
@@ -310,30 +327,15 @@ func udpChecksum(src4, dst4, udpSegment []byte) uint16 {
 
 // ── header template ───────────────────────────────────────────────────────────
 
+// hdrTemplate stores the per-session constants needed to build each spoofed packet.
 type hdrTemplate struct {
-	tpl     [28]byte
-	baseSum uint32
+	src4    [4]byte // spoofed source IP
+	dstPort uint16  // client's UDP listen port
 }
 
-func (h *hdrTemplate) build(src4, dst4 [4]byte, srcPort, dstPort uint16) {
-	t := &h.tpl
-	t[0] = 0x45 // IPv4, IHL=5
-	t[6] = 0x40 // DF
-	t[8] = 64   // TTL
-	t[9] = 17   // UDP
-	copy(t[12:16], src4[:])
-	copy(t[16:20], dst4[:])
-	binary.BigEndian.PutUint16(t[20:22], srcPort)
-	binary.BigEndian.PutUint16(t[22:24], dstPort)
-
-	var sum uint32
-	for i := 0; i < 20; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(t[i : i+2]))
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	h.baseSum = sum
+func (h *hdrTemplate) build(src4, _ [4]byte, _ uint16, dstPort uint16) {
+	h.src4 = src4
+	h.dstPort = dstPort
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
