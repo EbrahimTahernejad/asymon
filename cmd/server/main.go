@@ -256,17 +256,56 @@ func (s *Server) sendSpoofed(h *hdrTemplate, dst4 [4]byte, payload []byte) error
 	binary.BigEndian.PutUint16(pkt[2:4], totalLen)
 	binary.BigEndian.PutUint16(pkt[24:26], udpLen)
 
-	sum := h.baseSum + uint32(totalLen)
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
+	// IP checksum (incremental: baseSum computed with length=0)
+	ipSum := h.baseSum + uint32(totalLen)
+	for ipSum>>16 != 0 {
+		ipSum = (ipSum & 0xffff) + (ipSum >> 16)
 	}
-	binary.BigEndian.PutUint16(pkt[10:12], ^uint16(sum))
+	binary.BigEndian.PutUint16(pkt[10:12], ^uint16(ipSum))
+
+	// UDP checksum over pseudo-header + UDP header + payload.
+	// Many middleboxes drop UDP with checksum=0 even though it's optional in IPv4.
+	binary.BigEndian.PutUint16(pkt[26:28], 0) // clear first
+	udpCksum := udpChecksum(h.tpl[12:16], h.tpl[16:20], pkt[20:])
+	binary.BigEndian.PutUint16(pkt[26:28], udpCksum)
 
 	vlog("sendSpoofed: IP hdr hex: %s", hex.EncodeToString(pkt[:28]))
 
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], dst4[:])
 	return syscall.Sendto(s.rawFd, pkt, 0, &sa)
+}
+
+// udpChecksum computes the UDP checksum using the IPv4 pseudo-header.
+// src4, dst4 are the 4-byte IP addresses; udpSegment is the UDP header + payload.
+func udpChecksum(src4, dst4, udpSegment []byte) uint16 {
+	udpLen := uint16(len(udpSegment))
+	var sum uint32
+
+	// Pseudo-header: src IP, dst IP, zero, proto=17, UDP length
+	sum += uint32(src4[0])<<8 | uint32(src4[1])
+	sum += uint32(src4[2])<<8 | uint32(src4[3])
+	sum += uint32(dst4[0])<<8 | uint32(dst4[1])
+	sum += uint32(dst4[2])<<8 | uint32(dst4[3])
+	sum += 17
+	sum += uint32(udpLen)
+
+	// UDP header + payload
+	for i := 0; i+1 < len(udpSegment); i += 2 {
+		sum += uint32(udpSegment[i])<<8 | uint32(udpSegment[i+1])
+	}
+	if len(udpSegment)%2 != 0 {
+		sum += uint32(udpSegment[len(udpSegment)-1]) << 8
+	}
+
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	result := ^uint16(sum)
+	if result == 0 {
+		result = 0xffff // per RFC 768: transmit as all ones if computed result is zero
+	}
+	return result
 }
 
 // ── header template ───────────────────────────────────────────────────────────
