@@ -4,22 +4,19 @@
 //   Uplink:   local UDP → frame → TCP via SOCKS5 proxy → server
 //   Downlink: server spoofed UDP → local UDP app
 //
-// Usage:
-//   asymon-client -socks 127.0.0.1:1080 \
-//                 -server 1.2.3.4:4444  \
-//                 -local  :5555         \
-//                 -myip   1.2.3.4       \  ← your real Iran-side IP
-//                 -myport 5555             ← UDP port server should reply to
-//
 // The local KCP/QUIC app should connect to -local as if it were the remote server.
 package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -35,10 +32,19 @@ var (
 	localAddr  = flag.String("local", ":5555", "local UDP addr — your KCP/QUIC app connects here")
 	myIP       = flag.String("myip", "", "your real external IPv4 (sent to server so it knows where to spoof-reply)")
 	myPort     = flag.Int("myport", 0, "UDP port server should reply to (0 = same as -local port)")
+	verbose    = flag.Bool("v", false, "verbose logging (every packet, hex dumps, timing)")
 )
+
+func vlog(f string, a ...any) {
+	if *verbose {
+		log.Printf("[V] "+f, a...)
+	}
+}
 
 func main() {
 	flag.Parse()
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
 	if *serverAddr == "" {
 		log.Fatal("-server is required")
 	}
@@ -58,39 +64,59 @@ func main() {
 		udpPort = uint16(laddr.Port)
 	}
 
+	log.Printf("asymon client starting")
+	log.Printf("  socks5 proxy  : %v", *socksAddr)
+	log.Printf("  server        : %v", *serverAddr)
+	log.Printf("  local UDP     : %v", *localAddr)
+	log.Printf("  my real IP    : %v:%d", net.IP(realIP4[:]), udpPort)
+	if *verbose {
+		log.Printf("  verbose       : ON")
+	}
+
 	// Dial server via SOCKS5
+	vlog("creating SOCKS5 dialer via %v", *socksAddr)
+	t0 := time.Now()
 	dialer, err := proxy.SOCKS5("tcp", *socksAddr, nil, proxy.Direct)
 	if err != nil {
 		log.Fatalf("socks5 dialer: %v", err)
 	}
+
+	vlog("dialing %v through SOCKS5 ...", *serverAddr)
 	tc, err := dialer.Dial("tcp", *serverAddr)
 	if err != nil {
 		log.Fatalf("dial server via socks5: %v", err)
 	}
-	log.Printf("connected to server %v via socks5 %v", *serverAddr, *socksAddr)
-	log.Printf("real addr announced: %v:%d", net.IP(realIP4[:]), udpPort)
+	log.Printf("TCP connected to %v via socks5 %v (took %v)", *serverAddr, *socksAddr, time.Since(t0).Round(time.Millisecond))
 
 	// Handshake: [my real IPv4: 4][my UDP port: 2]
 	var hs [6]byte
 	copy(hs[0:4], realIP4[:])
 	binary.BigEndian.PutUint16(hs[4:6], udpPort)
+	vlog("sending handshake: %s (ip=%v port=%d)", hex.EncodeToString(hs[:]), net.IP(realIP4[:]), udpPort)
 	if _, err := tc.Write(hs[:]); err != nil {
-		log.Fatalf("handshake: %v", err)
+		log.Fatalf("handshake write: %v", err)
 	}
+	log.Printf("handshake sent — announced real addr %v:%d to server", net.IP(realIP4[:]), udpPort)
 
-	// Local UDP socket — talk to the KCP/QUIC app
+	// Local UDP socket
+	vlog("binding local UDP %v", laddr)
 	localConn, err := net.ListenUDP("udp4", laddr)
 	if err != nil {
 		log.Fatalf("listen local UDP %v: %v", laddr, err)
 	}
 	localConn.SetReadBuffer(sockBuf)
 	localConn.SetWriteBuffer(sockBuf)
-	log.Printf("local UDP ready on %v", laddr)
+	log.Printf("local UDP ready on %v (rcvbuf=%s sndbuf=%s)", laddr, fmtBytes(sockBuf), fmtBytes(sockBuf))
 
-	// We need to remember where the local app is (first packet sets this)
 	var (
 		appAddrMu sync.RWMutex
 		appAddr   *net.UDPAddr
+
+		uplinkPkts    atomic.Uint64
+		uplinkBytes   atomic.Uint64
+		downlinkPkts  atomic.Uint64
+		downlinkBytes atomic.Uint64
+		droppedPkts   atomic.Uint64
 	)
 
 	var wg sync.WaitGroup
@@ -101,54 +127,94 @@ func main() {
 		defer wg.Done()
 		defer tc.Close()
 		buf := make([]byte, maxPkt)
-		var lenBuf [2]byte
 		for {
 			n, addr, err := localConn.ReadFromUDP(buf)
 			if err != nil {
+				vlog("uplink: local UDP read error: %v", err)
 				return
 			}
-			// Remember the app's address so downlink knows where to deliver
+
+			pktNum := uplinkPkts.Add(1)
+			uplinkBytes.Add(uint64(n))
+
+			// Remember app address for downlink delivery
 			appAddrMu.Lock()
+			changed := appAddr == nil || appAddr.String() != addr.String()
 			appAddr = addr
 			appAddrMu.Unlock()
 
-			binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
-			// Write frame atomically (length + payload together)
+			if changed {
+				log.Printf("uplink: local app addr set to %v", addr)
+			}
+
+			vlog("uplink pkt#%d — %d bytes from local app %v → TCP frame → server", pktNum, n, addr)
+			if *verbose && n <= 64 {
+				vlog("uplink pkt#%d payload hex: %s", pktNum, hex.EncodeToString(buf[:n]))
+			} else if *verbose {
+				vlog("uplink pkt#%d payload hex (first 64): %s ...", pktNum, hex.EncodeToString(buf[:64]))
+			}
+
 			frame := make([]byte, 2+n)
-			copy(frame[:2], lenBuf[:])
+			binary.BigEndian.PutUint16(frame[:2], uint16(n))
 			copy(frame[2:], buf[:n])
-			if _, err := tc.Write(frame); err != nil {
+
+			sent, err := tc.Write(frame)
+			if err != nil {
+				log.Printf("uplink pkt#%d: TCP write failed: %v", pktNum, err)
 				return
 			}
+			vlog("uplink pkt#%d: wrote %d-byte frame (%d header + %d payload) to TCP", pktNum, sent, 2, n)
 		}
 	}()
 
-	// Downlink: spoofed UDP from server → local UDP app
-	// The server sends raw UDP to our real IP:port; we receive it on localConn.
-	// But wait — the server spoofs the SOURCE, not the destination.
-	// The dest is our real IP:udpPort. So we receive it on localConn (listening on udpPort).
-	// We then deliver the payload to the local KCP/QUIC app.
+	// Downlink: incoming UDP (spoofed from server) → local app
 	go func() {
 		defer wg.Done()
 		defer localConn.Close()
 		buf := make([]byte, maxPkt)
 		for {
-			n, _, err := localConn.ReadFromUDP(buf)
+			n, from, err := localConn.ReadFromUDP(buf)
 			if err != nil {
+				vlog("downlink: local UDP read error: %v", err)
 				return
 			}
+
+			pktNum := downlinkPkts.Add(1)
+			downlinkBytes.Add(uint64(n))
+
 			appAddrMu.RLock()
 			dst := appAddr
 			appAddrMu.RUnlock()
+
 			if dst == nil {
-				continue // no uplink yet, drop
+				dropped := droppedPkts.Add(1)
+				vlog("downlink pkt#%d — %d bytes from %v DROPPED (no uplink seen yet, total dropped=%d)",
+					pktNum, n, from, dropped)
+				continue
 			}
-			localConn.WriteToUDP(buf[:n], dst)
+
+			vlog("downlink pkt#%d — %d bytes from %v (spoofed) → local app %v", pktNum, n, from, dst)
+			if *verbose && n <= 64 {
+				vlog("downlink pkt#%d payload hex: %s", pktNum, hex.EncodeToString(buf[:n]))
+			} else if *verbose {
+				vlog("downlink pkt#%d payload hex (first 64): %s ...", pktNum, hex.EncodeToString(buf[:64]))
+			}
+
+			sent, err := localConn.WriteToUDP(buf[:n], dst)
+			if err != nil {
+				log.Printf("downlink pkt#%d: write to local app failed: %v", pktNum, err)
+			} else {
+				vlog("downlink pkt#%d: delivered %d bytes to local app %v", pktNum, sent, dst)
+			}
 		}
 	}()
 
 	wg.Wait()
-	log.Println("session closed")
+
+	log.Printf("session closed")
+	log.Printf("  uplink   : %d pkts / %s", uplinkPkts.Load(), fmtBytes(uplinkBytes.Load()))
+	log.Printf("  downlink : %d pkts / %s", downlinkPkts.Load(), fmtBytes(downlinkBytes.Load()))
+	log.Printf("  dropped  : %d pkts (no local app addr at time of arrival)", droppedPkts.Load())
 }
 
 func mustIP4(s string) [4]byte {
@@ -157,4 +223,15 @@ func mustIP4(s string) [4]byte {
 		log.Fatalf("invalid IPv4 %q", s)
 	}
 	return [4]byte(ip)
+}
+
+func fmtBytes(b uint64) string {
+	switch {
+	case b >= 1<<20:
+		return fmt.Sprintf("%.2f MiB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.2f KiB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
