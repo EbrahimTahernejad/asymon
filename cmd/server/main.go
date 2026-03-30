@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -29,15 +30,15 @@ import (
 )
 
 const (
-	maxPkt  = 65507
-	sockBuf = 8 << 20
+	maxPkt    = 65507
+	sockBuf   = 8 << 20
+	tcpBufSz  = 64 << 10 // bufio read buffer per connection
 )
 
 var (
 	listenAddr  = flag.String("l", ":4444", "TCP listen addr (clients connect here via SOCKS5)")
 	backendAddr = flag.String("b", "127.0.0.1:5555", "backend UDP addr (KCP/QUIC server)")
 	spoofSrc    = flag.String("spoof-src", "", "spoof source IP for UDP downlink (required)")
-	spoofPort   = flag.Int("spoof-port", 0, "spoof source port (0 = same as -l port)")
 	verbose     = flag.Bool("v", false, "verbose logging (every packet, hex dumps, timing)")
 )
 
@@ -46,6 +47,12 @@ func vlog(f string, a ...any) {
 		log.Printf("[V] "+f, a...)
 	}
 }
+
+// pktPool holds pre-allocated send buffers (IP+UDP+payload).
+var pktPool = sync.Pool{New: func() any {
+	b := make([]byte, 28+maxPkt)
+	return &b
+}}
 
 func main() {
 	flag.Parse()
@@ -56,15 +63,6 @@ func main() {
 	}
 
 	src4 := mustIP4(*spoofSrc)
-	sp := uint16(*spoofPort)
-	if sp == 0 {
-		_, portStr, _ := net.SplitHostPort(*listenAddr)
-		var p int
-		for _, b := range []byte(portStr) {
-			p = p*10 + int(b-'0')
-		}
-		sp = uint16(p)
-	}
 
 	baddr, err := net.ResolveUDPAddr("udp4", *backendAddr)
 	if err != nil {
@@ -88,19 +86,25 @@ func main() {
 	log.Printf("asymon server ready")
 	log.Printf("  TCP listen    : %v", *listenAddr)
 	log.Printf("  backend UDP   : %v", baddr)
-	log.Printf("  spoof src     : %v:%d", net.IP(src4[:]), sp)
+	log.Printf("  spoof src     : %v", net.IP(src4[:]))
 	if *verbose {
 		log.Printf("  verbose       : ON")
 	}
 
-	srv := &Server{rawFd: rawFd, spoofSrc: src4, spoofPort: sp, backend: baddr}
+	srv := &Server{rawFd: rawFd, spoofSrc: src4, backend: baddr}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		vlog("accepted TCP connection from %v", conn.RemoteAddr())
+		// Disable Nagle — we control framing, small writes must go immediately.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(30 * time.Second)
+		}
+		vlog("accepted TCP from %v", conn.RemoteAddr())
 		go srv.handle(conn)
 	}
 }
@@ -108,10 +112,9 @@ func main() {
 // ── server ────────────────────────────────────────────────────────────────────
 
 type Server struct {
-	rawFd     int
-	spoofSrc  [4]byte
-	spoofPort uint16
-	backend   *net.UDPAddr
+	rawFd    int
+	spoofSrc [4]byte
+	backend  *net.UDPAddr
 }
 
 func (s *Server) handle(tc net.Conn) {
@@ -119,174 +122,150 @@ func (s *Server) handle(tc net.Conn) {
 	remote := tc.RemoteAddr()
 	connStart := time.Now()
 
-	vlog("%v: reading 6-byte handshake", remote)
-
 	// Handshake: [client real IPv4: 4][client UDP port: 2]
 	var hs [6]byte
 	if _, err := io.ReadFull(tc, hs[:]); err != nil {
-		log.Printf("%v: handshake read failed: %v", remote, err)
+		log.Printf("%v: handshake: %v", remote, err)
 		return
 	}
 	clientIP4 := [4]byte(hs[0:4])
 	clientPort := binary.BigEndian.Uint16(hs[4:6])
+	log.Printf("%v: client real addr %v:%d", remote, net.IP(clientIP4[:]), clientPort)
+	vlog("%v: handshake bytes: %s", remote, hex.EncodeToString(hs[:]))
 
-	log.Printf("%v: handshake OK — client real addr %v:%d", remote, net.IP(clientIP4[:]), clientPort)
-	vlog("%v: handshake raw bytes: %s", remote, hex.EncodeToString(hs[:]))
-
-	// Dial backend UDP
-	vlog("%v: dialing backend UDP %v", remote, s.backend)
 	up, err := net.DialUDP("udp4", nil, s.backend)
 	if err != nil {
-		log.Printf("%v: dial backend failed: %v", remote, err)
+		log.Printf("%v: dial backend: %v", remote, err)
 		return
 	}
 	up.SetReadBuffer(sockBuf)
 	up.SetWriteBuffer(sockBuf)
 	defer up.Close()
-	vlog("%v: backend UDP socket ready (rcvbuf=%d snduf=%d)", remote, sockBuf, sockBuf)
 
-	// Pre-build IP+UDP header template for this client
-	var hdr hdrTemplate
-	hdr.build(s.spoofSrc, clientIP4, s.spoofPort, clientPort)
-	vlog("%v: session ready — spoof src=%v dst=%v:%d",
-		remote, net.IP(s.spoofSrc[:]), net.IP(clientIP4[:]), clientPort,
-	)
+	// Per-session rand — avoids global lock on hot path.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	var (
-		wg         sync.WaitGroup
-		uplinkPkts atomic.Uint64
-		uplinkBytes atomic.Uint64
-		downlinkPkts atomic.Uint64
+		wg            sync.WaitGroup
+		uplinkPkts    atomic.Uint64
+		uplinkBytes   atomic.Uint64
+		downlinkPkts  atomic.Uint64
 		downlinkBytes atomic.Uint64
 	)
 	wg.Add(2)
 
-	// TCP → UDP backend (uplink)
+	// ── uplink: TCP → backend UDP ──────────────────────────────────────────
 	go func() {
 		defer wg.Done()
 		defer up.Close()
+
+		// bufio.Reader amortises the 2-byte length reads into large kernel reads.
+		br := bufio.NewReaderSize(tc, tcpBufSz)
 		var lenBuf [2]byte
 		buf := make([]byte, maxPkt)
+
 		for {
-			if _, err := io.ReadFull(tc, lenBuf[:]); err != nil {
-				vlog("%v: uplink: TCP length read: %v", remote, err)
+			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
+				vlog("%v: uplink EOF: %v", remote, err)
 				return
 			}
 			n := int(binary.BigEndian.Uint16(lenBuf[:]))
 			if n == 0 || n > maxPkt {
-				log.Printf("%v: uplink: invalid frame length %d, closing", remote, n)
+				log.Printf("%v: uplink: bad frame len %d", remote, n)
 				return
 			}
-			if _, err := io.ReadFull(tc, buf[:n]); err != nil {
-				vlog("%v: uplink: TCP payload read: %v", remote, err)
+			if _, err := io.ReadFull(br, buf[:n]); err != nil {
+				vlog("%v: uplink read payload: %v", remote, err)
 				return
 			}
 
 			pktNum := uplinkPkts.Add(1)
 			uplinkBytes.Add(uint64(n))
+			vlog("%v: up#%d %d B → backend", remote, pktNum, n)
 
-			vlog("%v: uplink pkt#%d — %d bytes → backend", remote, pktNum, n)
-			if *verbose && n <= 64 {
-				vlog("%v: uplink pkt#%d payload hex: %s", remote, pktNum, hex.EncodeToString(buf[:n]))
-			} else if *verbose {
-				vlog("%v: uplink pkt#%d payload hex (first 64): %s ...", remote, pktNum, hex.EncodeToString(buf[:64]))
-			}
-
-			sent, err := up.Write(buf[:n])
-			if err != nil {
-				log.Printf("%v: uplink: backend write failed: %v", remote, err)
+			if _, err := up.Write(buf[:n]); err != nil {
+				log.Printf("%v: uplink write backend: %v", remote, err)
 				return
 			}
-			vlog("%v: uplink pkt#%d — wrote %d/%d bytes to backend UDP", remote, pktNum, sent, n)
 		}
 	}()
 
-	// UDP backend → spoofed UDP → client (downlink)
+	// ── downlink: backend UDP → spoofed UDP → client ───────────────────────
 	go func() {
 		defer wg.Done()
 		defer tc.Close()
+
 		buf := make([]byte, maxPkt)
 		for {
 			n, err := up.Read(buf)
 			if err != nil {
-				vlog("%v: downlink: backend read: %v", remote, err)
+				vlog("%v: downlink backend read: %v", remote, err)
 				return
 			}
 
 			pktNum := downlinkPkts.Add(1)
 			downlinkBytes.Add(uint64(n))
+			vlog("%v: dn#%d %d B → %v:%d", remote, pktNum, n, net.IP(clientIP4[:]), clientPort)
 
-			vlog("%v: downlink pkt#%d — %d bytes from backend → spoofed UDP → %v:%d",
-				remote, pktNum, n, net.IP(clientIP4[:]), clientPort)
-			if *verbose && n <= 64 {
-				vlog("%v: downlink pkt#%d payload hex: %s", remote, pktNum, hex.EncodeToString(buf[:n]))
-			} else if *verbose {
-				vlog("%v: downlink pkt#%d payload hex (first 64): %s ...", remote, pktNum, hex.EncodeToString(buf[:64]))
-			}
-
-			if err := s.sendSpoofed(&hdr, clientIP4, buf[:n]); err != nil {
-				log.Printf("%v: downlink pkt#%d: sendSpoofed failed: %v", remote, pktNum, err)
-			} else {
-				vlog("%v: downlink pkt#%d: raw sendto OK (%d IP bytes total)",
-					remote, pktNum, 28+n)
+			if err := s.sendSpoofed(rng, clientIP4, clientPort, buf[:n]); err != nil {
+				log.Printf("%v: dn#%d sendSpoofed: %v", remote, pktNum, err)
 			}
 		}
 	}()
 
 	wg.Wait()
-
 	dur := time.Since(connStart)
-	log.Printf("%v: session closed — duration=%v uplink=%d pkts/%s downlink=%d pkts/%s",
+	log.Printf("%v: closed — %v  up=%d/%s  dn=%d/%s",
 		remote, dur.Round(time.Millisecond),
 		uplinkPkts.Load(), fmtBytes(uplinkBytes.Load()),
 		downlinkPkts.Load(), fmtBytes(downlinkBytes.Load()),
 	)
 }
 
-func (s *Server) sendSpoofed(h *hdrTemplate, dst4 [4]byte, payload []byte) error {
+// ── spoofed send ──────────────────────────────────────────────────────────────
+
+func (s *Server) sendSpoofed(rng *rand.Rand, dst4 [4]byte, dstPort uint16, payload []byte) error {
 	totalLen := uint16(20 + 8 + len(payload))
 	udpLen   := uint16(8 + len(payload))
-	srcPort  := uint16(1024 + rand.Intn(64512)) // random ephemeral src port per packet
-	ipID     := uint16(rand.Intn(65536))
 
-	pkt := make([]byte, int(totalLen))
+	// Get a pre-allocated buffer from the pool.
+	bp := pktPool.Get().(*[]byte)
+	pkt := (*bp)[:totalLen]
+	defer pktPool.Put(bp)
 
-	// IPv4 header — no DF flag (flags_frag = 0), matches Python behaviour
+	// IPv4 header — flags=0 (no DF), random ID per packet.
 	pkt[0] = 0x45
 	pkt[1] = 0
 	binary.BigEndian.PutUint16(pkt[2:4], totalLen)
-	binary.BigEndian.PutUint16(pkt[4:6], ipID)
-	pkt[6], pkt[7] = 0, 0 // flags=0, frag offset=0 — NO DF
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(rng.Intn(65536))) // random ID
+	pkt[6], pkt[7] = 0, 0                                          // no DF, no fragment
 	pkt[8] = 64
 	pkt[9] = 17
-	// [10:12] checksum filled below
-	copy(pkt[12:16], h.src4[:]) // src IP
+	pkt[10], pkt[11] = 0, 0 // checksum, filled below
+	copy(pkt[12:16], s.spoofSrc[:])
 	copy(pkt[16:20], dst4[:])
 
-	// UDP header
-	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
-	binary.BigEndian.PutUint16(pkt[22:24], h.dstPort)
+	// UDP header — random ephemeral source port per packet.
+	binary.BigEndian.PutUint16(pkt[20:22], uint16(1024+rng.Intn(64512)))
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
 	binary.BigEndian.PutUint16(pkt[24:26], udpLen)
-	// [26:28] UDP checksum filled below
+	pkt[26], pkt[27] = 0, 0 // UDP checksum, filled below
 
 	copy(pkt[28:], payload)
 
-	// IP checksum
+	// IP header checksum.
 	var ipSum uint32
 	for i := 0; i < 20; i += 2 {
-		ipSum += uint32(binary.BigEndian.Uint16(pkt[i : i+2]))
+		ipSum += uint32(pkt[i])<<8 | uint32(pkt[i+1])
 	}
 	for ipSum>>16 != 0 {
 		ipSum = (ipSum & 0xffff) + (ipSum >> 16)
 	}
 	binary.BigEndian.PutUint16(pkt[10:12], ^uint16(ipSum))
 
-	// UDP checksum
-	udpCksum := udpChecksum(pkt[12:16], pkt[16:20], pkt[20:])
-	binary.BigEndian.PutUint16(pkt[26:28], udpCksum)
-
-	vlog("sendSpoofed: src_port=%d id=%d total=%d IP hdr: %s",
-		srcPort, ipID, totalLen, hex.EncodeToString(pkt[:28]))
+	// UDP checksum with pseudo-header.
+	ck := udpChecksum(pkt[12:16], pkt[16:20], pkt[20:totalLen])
+	binary.BigEndian.PutUint16(pkt[26:28], ck)
 
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], dst4[:])
@@ -294,48 +273,28 @@ func (s *Server) sendSpoofed(h *hdrTemplate, dst4 [4]byte, payload []byte) error
 }
 
 // udpChecksum computes the UDP checksum using the IPv4 pseudo-header.
-// src4, dst4 are the 4-byte IP addresses; udpSegment is the UDP header + payload.
-func udpChecksum(src4, dst4, udpSegment []byte) uint16 {
-	udpLen := uint16(len(udpSegment))
+func udpChecksum(src4, dst4, udpSeg []byte) uint16 {
+	length := uint16(len(udpSeg))
 	var sum uint32
-
-	// Pseudo-header: src IP, dst IP, zero, proto=17, UDP length
 	sum += uint32(src4[0])<<8 | uint32(src4[1])
 	sum += uint32(src4[2])<<8 | uint32(src4[3])
 	sum += uint32(dst4[0])<<8 | uint32(dst4[1])
 	sum += uint32(dst4[2])<<8 | uint32(dst4[3])
 	sum += 17
-	sum += uint32(udpLen)
-
-	// UDP header + payload
-	for i := 0; i+1 < len(udpSegment); i += 2 {
-		sum += uint32(udpSegment[i])<<8 | uint32(udpSegment[i+1])
+	sum += uint32(length)
+	for i := 0; i+1 < len(udpSeg); i += 2 {
+		sum += uint32(udpSeg[i])<<8 | uint32(udpSeg[i+1])
 	}
-	if len(udpSegment)%2 != 0 {
-		sum += uint32(udpSegment[len(udpSegment)-1]) << 8
+	if len(udpSeg)%2 != 0 {
+		sum += uint32(udpSeg[len(udpSeg)-1]) << 8
 	}
-
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)
 	}
-	result := ^uint16(sum)
-	if result == 0 {
-		result = 0xffff // per RFC 768: transmit as all ones if computed result is zero
+	if r := ^uint16(sum); r != 0 {
+		return r
 	}
-	return result
-}
-
-// ── header template ───────────────────────────────────────────────────────────
-
-// hdrTemplate stores the per-session constants needed to build each spoofed packet.
-type hdrTemplate struct {
-	src4    [4]byte // spoofed source IP
-	dstPort uint16  // client's UDP listen port
-}
-
-func (h *hdrTemplate) build(src4, _ [4]byte, _ uint16, dstPort uint16) {
-	h.src4 = src4
-	h.dstPort = dstPort
+	return 0xffff
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
